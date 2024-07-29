@@ -1,106 +1,72 @@
 package com.andrewchik.fishingrodfix.mixin.client;
 
+import com.llamalad7.mixinextras.sugar.Local;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.client.render.VertexConsumer;
+import net.minecraft.client.option.Perspective;
+import net.minecraft.client.render.entity.EntityRenderDispatcher;
 import net.minecraft.client.render.entity.FishingBobberEntityRenderer;
-import net.minecraft.client.util.math.MatrixStack;
-import net.minecraft.item.FishingRodItem;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.Arm;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.MathHelper;
-import org.joml.Vector3f;
+import net.minecraft.util.math.Vec3d;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import static com.andrewchik.fishingrodfix.FishingRodFixClient.projection;
 
 @Mixin(FishingBobberEntityRenderer.class)
 public class FishingBobberEntityRendererMixin {
     @Unique
-    private static final Vector3f translate = new Vector3f();
+    private static final MinecraftClient mc = MinecraftClient.getInstance();
     @Unique
-    private static int counter = 0;
+    private static final float D2R = (float) Math.PI / 180;
 
-    @Inject(method = "Lnet/minecraft/client/render/entity/FishingBobberEntityRenderer;renderFishingLine(FFFLnet/minecraft/client/render/VertexConsumer;Lnet/minecraft/client/util/math/MatrixStack$Entry;FF)V", at = @At("HEAD"), cancellable = true)
-    private static void renderFishingLine(float x, float y, float z, VertexConsumer buffer, MatrixStack.Entry matrices, float segmentStart, float segmentEnd, CallbackInfo ci) {
-        float f = x * segmentStart;
-        float g = y * (segmentStart * segmentStart + segmentStart) * 0.5F + 0.25F;
-        float h = z * segmentStart;
-        float i = x * segmentEnd - f;
-        float j = y * (segmentEnd * segmentEnd + segmentEnd) * 0.5F + 0.25F - g;
-        float k = z * segmentEnd - h;
-        float l = MathHelper.sqrt(i * i + j * j + k * k);
-        i /= l;
-        j /= l;
-        k /= l;
-        buffer.vertex(matrices.getPositionMatrix().translate(getTranslate()), f, g, h).color(0, 0, 0, 255).normal(matrices, i, j, k);
-        ci.cancel();
+    @Redirect(method = "getHandPos", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/option/Perspective;isFirstPerson()Z"))
+    private boolean fixFreeCam(Perspective instance, @Local(argsOnly = true) PlayerEntity player) {
+        return instance.isFirstPerson() && player == mc.getCameraEntity();
     }
 
-    @Unique
-    private static Vector3f getTranslate() {
-        if (counter == 17) {
-            calculateTranslate();
-            counter = 0;
-        }
-        counter++;
-        return translate;
+    @Inject(method = "getHandPos", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/option/GameOptions;getFov()Lnet/minecraft/client/option/SimpleOption;"), cancellable = true)
+    private void fixFirstPersonPosition(PlayerEntity player, float f, float tickDelta, CallbackInfoReturnable<Vec3d> cir, @Local int i) {
+        cir.setReturnValue(firstPersonFallback(player, f, tickDelta, i));
     }
 
-    @Unique
-    private static float getTickDelta() {
-        return MinecraftClient.getInstance().isPaused() ? MinecraftClient.getInstance().renderTickCounter.tickDelta : MinecraftClient.getInstance().renderTickCounter.tickDeltaBeforePause;
+    @Unique // a calculating approach of rendering fishing line in first person, it's imperfect but pretty accurate
+    private Vec3d firstPersonFallback(PlayerEntity player, float swingHandCoefficient, float tickDelta, int side) {
+        ClientPlayerEntity p = mc.player;
+        assert p != null;
+        EntityRenderDispatcher dispatcher = mc.getEntityRenderDispatcher();
+
+        double fov = dispatcher.gameOptions.getFov().getValue();
+        double dFovCorrection = 1 / (Math.tan(fov / 2 * D2R) * projection.m11());
+
+        boolean isMain = dispatcher.gameOptions.getMainArm().getValue() == Arm.RIGHT ^ side < 0;
+        // preferredHand, aka swinging hand
+        if (player.preferredHand == Hand.MAIN_HAND ^ isMain) {
+            swingHandCoefficient = 0;
+        }
+
+        float dPitch = (player.getPitch(tickDelta) - MathHelper.lerp(tickDelta, p.lastRenderPitch, p.renderPitch)) * 0.1F * D2R;
+        float dYaw = (player.getYaw(tickDelta) - MathHelper.lerp(tickDelta, p.lastRenderYaw, p.renderYaw)) % 360 * 0.1F;
+        if (dYaw > 18) dYaw -= 36;
+        else if (dYaw < -18) dYaw += 36;
+        dYaw *= D2R;
+
+        HeldItemRendererAccess fpr = (HeldItemRendererAccess) mc.gameRenderer.firstPersonRenderer;
+        float progress = isMain
+                ? MathHelper.lerp(tickDelta, fpr.getPrevEquipProgressMainHand(), fpr.getEquipProgressMainHand())
+                : MathHelper.lerp(tickDelta, fpr.getPrevEquipProgressOffHand(), fpr.getEquipProgressOffHand());
+
+        return dispatcher.camera.getProjection().getPosition( // ah yes, magic numbers
+                (float) (side * (1.125 / ((double) mc.getWindow().getWidth() / mc.getWindow().getHeight())) * (1 - swingHandCoefficient * 1.04) * dFovCorrection),
+                (float) ((-1.1 + progress - 0.5 * swingHandCoefficient) * dFovCorrection)
+        ).multiply(960.0 / fov).rotateY(dYaw).rotateX(dPitch).add(dispatcher.camera.getPos());
     }
 
-    @Unique
-    private static void calculateTranslate() {
-        ClientPlayerEntity player = MinecraftClient.getInstance().player;
-
-        if (MinecraftClient.getInstance().gameRenderer.getCamera().isThirdPerson() || player == null) {
-            translate.x = 0;
-            translate.y = 0;
-            translate.z = 0;
-            return;
-        }
-
-        float width = MinecraftClient.getInstance().getWindow().getWidth();
-        float height = MinecraftClient.getInstance().getWindow().getHeight();
-        float ratio = width / height;
-        ratio -= 16f / 9f;
-
-        ratio /= 68f; // Experimental value that normalizes rendering
-
-        // FOV corrections
-        float fov = MinecraftClient.getInstance().options.getFov().getValue().floatValue();
-        ratio /= (70f - fov) / 180f + 1;
-
-        // TODO: add fov effects
-        // float fovEffected = (float) MinecraftClient.getInstance().gameRenderer.getFov(MinecraftClient.getInstance().gameRenderer.getCamera(), getTickDelta(), true);
-        // float fovDiff = fovEffected - fov;
-        // ratio -= fovDiff / 1000f;
-
-        if (MinecraftClient.getInstance().options.getMainArm().getValue() == Arm.LEFT) {
-            ratio *= -1;
-        }
-        if (player.getStackInHand(Hand.OFF_HAND).getItem() instanceof FishingRodItem) {
-            ratio *= -1;
-        }
-
-        // Apply item acceleration when camera is moving
-        float h = MathHelper.lerp(getTickDelta(), player.lastRenderPitch, player.renderPitch);
-        float i = MathHelper.lerp(getTickDelta(), player.lastRenderYaw, player.renderYaw);
-
-        // Crouching animation
-        float crouch = 0;
-        if (player.isOnGround())
-            crouch = (float)(MinecraftClient.getInstance().gameRenderer.getCamera().getPos().y - player.getPos().y) - player.getStandingEyeHeight();
-
-        translate.x = ratio + (player.getYaw(getTickDelta()) - i) * 0.00011f;
-        translate.y = (player.getPitch(getTickDelta()) - h) * 0.0001f + crouch / 16f;
-        translate.z = 0;
-
-        translate.rotateY(player.getYaw(getTickDelta()) / -180f * MathHelper.PI);
-    }
 }
